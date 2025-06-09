@@ -1,10 +1,10 @@
 import os
 import requests
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
+from typing import Optional
 from openai import OpenAI
 
-# اقرأ المتغيرات البيئية (يفضل تحفظهم في .env)
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 
@@ -12,36 +12,39 @@ app = FastAPI()
 client = OpenAI(api_key=OPENAI_API_KEY)
 
 class UserMessage(BaseModel):
-    message: str
+    stage: str  # "start" or "destination"
+    start_desc: Optional[str] = None  # جواب المستخدم على جهة الانطلاق
+    message: Optional[str] = None     # الوجهة (جواب المستخدم للوجهة)
+    lat: Optional[float] = None
+    lng: Optional[float] = None
 
-def extract_locations(text):
-    # استخدم GPT لتحليل الرسالة واستخراج المواقع
+def reverse_geocode(lat, lng):
+    url = f"https://maps.googleapis.com/maps/api/geocode/json?latlng={lat},{lng}&language=ar&region=SA&key={GOOGLE_MAPS_API_KEY}"
+    response = requests.get(url)
+    data = response.json()
+    if data['status'] == 'OK':
+        address = data['results'][0]['formatted_address']
+        return address
+    else:
+        return "موقعك الحالي"
+
+def extract_destination(text):
     prompt = f"""
-    استخرج لي اسم موقع الانطلاق واسم الوجهة من هذه الرسالة بالعربي فقط بدون شرح:
+    استخرج فقط اسم الوجهة (المكان الذي يريد الذهاب إليه) من هذه الرسالة:
     "{text}"
-    الرد يكون بصيغة: 
-    الانطلاق: <الانطلاق>
-    الوجهة: <الوجهة>
+    الرد فقط باسم الوجهة بدون شرح.
     """
     completion = client.chat.completions.create(
-        model="gpt-3.5-turbo",  # ممكن تستخدم gpt-4o إذا متوفر عندك
+        model="gpt-3.5-turbo",
         messages=[
-            {"role": "system", "content": "انت مساعد افتراضي مهمتك تستخرج مواقع من الرسائل فقط"},
+            {"role": "system", "content": "انت مساعد افتراضي مهمتك فقط استخراج اسم الوجهة من الرسائل بدون شرح."},
             {"role": "user", "content": prompt}
         ]
     )
-    reply = completion.choices[0].message.content
-    # استخراج النص من الرد
-    start, end = None, None
-    for line in reply.splitlines():
-        if line.startswith("الانطلاق:"):
-            start = line.replace("الانطلاق:", "").strip()
-        elif line.startswith("الوجهة:"):
-            end = line.replace("الوجهة:", "").strip()
-    return start, end
+    return completion.choices[0].message.content.strip()
 
 def get_location_coordinates(location_name):
-    url = f'https://maps.googleapis.com/maps/api/geocode/json?address={location_name}&key={GOOGLE_MAPS_API_KEY}'
+    url = f'https://maps.googleapis.com/maps/api/geocode/json?address={location_name}&region=sa&key={GOOGLE_MAPS_API_KEY}'
     response = requests.get(url)
     data = response.json()
     if data['status'] == 'OK':
@@ -51,32 +54,46 @@ def get_location_coordinates(location_name):
         return None
 
 @app.post("/chatbot")
-def process_user_message(msg: UserMessage):
-    # 1. استخرج المواقع من الرسالة
-    start, end = extract_locations(msg.message)
-    if not start or not end:
-        return {"success": False, "message": "يرجى تحديد موقع الانطلاق والوجهة بوضوح"}
-
-    # 2. تحقق من المواقع باستخدام Google Maps API
-    start_coords = get_location_coordinates(start)
-    end_coords = get_location_coordinates(end)
-
-    if not start_coords or not end_coords:
-        missing = []
-        if not start_coords:
-            missing.append(f"الانطلاق ({start})")
-        if not end_coords:
-            missing.append(f"الوجهة ({end})")
+def chat_flow(msg: UserMessage):
+    # المرحلة الأولى: اقتراح جهة الانطلاق
+    if msg.stage == "start":
+        current_loc_name = reverse_geocode(msg.lat, msg.lng) if msg.lat and msg.lng else "موقعك الحالي"
         return {
-            "success": False,
-            "message": f"تعذر تحديد الموقع بدقة: {' و '.join(missing)}. يرجى إعادة كتابة المواقع بشكل أوضح."
+            "success": True,
+            "ask": f"وين بدك جهة الانطلاق؟ من ({current_loc_name}) ولا تكتب مكان ثاني بنفسك؟",
+            "current_loc_name": current_loc_name,
+            "lat": msg.lat,
+            "lng": msg.lng,
         }
 
-    # 3. أرجع الرد المنظم
-    return {
-        "success": True,
-        "start": {"name": start, "coords": start_coords},
-        "end": {"name": end, "coords": end_coords},
-        "message": f"تم تحديد موقع الانطلاق ({start}) والوجهة ({end}) بنجاح."
-    }
+    # المرحلة الثانية: تحديد الوجهة
+    elif msg.stage == "destination":
+        # حدد نقطة الانطلاق
+        if not msg.start_desc or msg.start_desc.strip() == "" or msg.start_desc.lower() in ["موقعي", "الموقع الحالي"]:
+            # استخدم موقع المستخدم الحالي
+            if msg.lat and msg.lng:
+                start_coords = (msg.lat, msg.lng)
+                start_desc = reverse_geocode(msg.lat, msg.lng)
+            else:
+                return {"success": False, "message": "تعذر جلب الموقع الحالي. حاول مجددًا."}
+        else:
+            # المستخدم كتب نقطة انطلاق يدويًا
+            start_desc = msg.start_desc
+            start_coords = get_location_coordinates(start_desc)
+            if not start_coords:
+                return {"success": False, "message": f"تعذر تحديد موقع الانطلاق ({start_desc}). اكتب اسم أوضح."}
 
+        # حدد الوجهة
+        if not msg.message:
+            return {"success": False, "message": "يرجى إرسال اسم الوجهة."}
+        end = extract_destination(msg.message)
+        end_coords = get_location_coordinates(end)
+        if not end_coords:
+            return {"success": False, "message": f"تعذر تحديد الوجهة ({end}). اكتب اسم أوضح."}
+
+        return {
+            "success": True,
+            "message": f"تم تحديد رحلتك من ({start_desc}) إلى ({end}) بنجاح.",
+            "start": {"name": start_desc, "coords": start_coords},
+            "end": {"name": end, "coords": end_coords}
+        }
