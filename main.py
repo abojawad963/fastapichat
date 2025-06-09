@@ -1,38 +1,52 @@
-# main.py
-import os, uuid, requests, datetime
+import os, uuid, requests
 from typing import Optional, Dict, Any
 from fastapi import FastAPI
 from pydantic import BaseModel
 from openai import OpenAI
 
-# مفاتيح البيئة
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
-
-# جلســات الدردشة في الذاكرة
 sessions: Dict[str, Dict[str, Any]] = {}
 
-# ---------- أدوات مساعدة ---------- #
-def reverse_geocode(lat: float, lng: float) -> str:
+# -- أداة geocode وتحقق الشرقية --
+def geocode_and_check_eastern(name: str):
+    url = (
+        "https://maps.googleapis.com/maps/api/geocode/json"
+        f"?address={name}&region=SA&language=ar&key={GOOGLE_MAPS_API_KEY}"
+    )
+    data = requests.get(url).json()
+    if data["status"] == "OK" and data["results"]:
+        address = data["results"][0]["formatted_address"]
+        # ابحث عن كلمة "الشرقية" أو "Eastern Province" في كل العناوين الجانبية
+        for comp in data["results"][0]["address_components"]:
+            if (
+                ("الشرقية" in comp.get("long_name", ""))
+                or ("Eastern Province" in comp.get("long_name", ""))
+            ):
+                return address
+        # إذا لم يجد "الشرقية" في العنوان
+        return None
+    return None
+
+def reverse_geocode(lat: float, lng: float):
     url = (
         "https://maps.googleapis.com/maps/api/geocode/json"
         f"?latlng={lat},{lng}&language=ar&region=SA&key={GOOGLE_MAPS_API_KEY}"
     )
     data = requests.get(url).json()
     if data["status"] == "OK":
-        return data["results"][0]["formatted_address"]
-    return "موقعك الحالي"
-
-def geocode(name: str):
-    url = (
-        "https://maps.googleapis.com/maps/api/geocode/json"
-        f"?address={name}&region=SA&language=ar&key={GOOGLE_MAPS_API_KEY}"
-    )
-    data = requests.get(url).json()
-    return data["results"][0] if data["status"] == "OK" else None
+        address = data["results"][0]["formatted_address"]
+        for comp in data["results"][0]["address_components"]:
+            if (
+                ("الشرقية" in comp.get("long_name", ""))
+                or ("Eastern Province" in comp.get("long_name", ""))
+            ):
+                return address
+        return None
+    return None
 
 def extract_destination(text: str) -> str:
     prompt = f'استخرج اسم الوجهة من الرسالة التالية بدون أي كلمات إضافية:\n"{text}"'
@@ -45,7 +59,6 @@ def extract_destination(text: str) -> str:
     )
     return rsp.choices[0].message.content.strip()
 
-# ---------- بيانات الطلب/الرد ---------- #
 class UserRequest(BaseModel):
     sessionId: Optional[str] = None
     userInput: Optional[str] = None
@@ -57,14 +70,17 @@ class BotResponse(BaseModel):
     botMessage: str
     done: bool = False
 
-# ---------- منطق الحوار ---------- #
 def new_session(lat: float | None, lng: float | None) -> tuple[str, str]:
+    # تحقق أن الموقع الحالي داخل الشرقية
+    start_name = reverse_geocode(lat, lng) if lat and lng else None
+    if not start_name:
+        return "", "عذراً، هذه الخدمة متوفرة فقط في المنطقة الشرقية. يرجى تحديد موقعك داخل الشرقية."
     sess_id = str(uuid.uuid4())
     sessions[sess_id] = {
         "step": "ask_destination",
         "lat": lat,
         "lng": lng,
-        "start_name": reverse_geocode(lat, lng) if lat and lng else None,
+        "start_name": start_name,
         "dest_name": None,
         "time": None,
         "car": None,
@@ -79,31 +95,36 @@ def proceed(session: Dict[str, Any], user_input: str) -> str:
     # 1) الوجهة
     if step == "ask_destination":
         dest = extract_destination(user_input)
-        session["dest_name"] = dest
+        dest_name = geocode_and_check_eastern(dest)
+        if not dest_name:
+            return "تعذر تحديد موقع الوجهة أو أنها ليست ضمن المنطقة الشرقية. يرجى كتابة اسم أوضح أو أقرب حي/مدينة داخل الشرقية."
+        session["dest_name"] = dest_name
         session["step"] = "ask_start"
         return (
             f"هل تريد أن نأخذك من موقعك الحالي ({session['start_name']})"
             " أم تفضل الانطلاق من مكان آخر؟"
         )
 
-    # 2) الانطلاق
+    # 2) جهة الانطلاق
     if step == "ask_start":
         txt = user_input.strip().lower()
         if txt in {"موقعي", "موقعي الحالي", "الموقع الحالي"}:
-            # احتفظ بالاسم الموجود مسبقاً
+            # استخدم الموقع الحالي (تم التحقق منه مسبقاً)
             pass
         else:
-            session["start_name"] = user_input
+            start_name = geocode_and_check_eastern(user_input)
+            if not start_name:
+                return "تعذر تحديد موقع الانطلاق أو أنه ليس ضمن المنطقة الشرقية. يرجى كتابة اسم أوضح أو أقرب حي/مدينة داخل الشرقية."
+            session["start_name"] = start_name
         session["step"] = "ask_time"
         return "متى تريد الانطلاق؟"
 
-    # 3) الوقت
+    # باقي الخطوات كما هي...
     if step == "ask_time":
         session["time"] = user_input
         session["step"] = "ask_car"
         return "ما نوع السيارة التي تفضلها؟ عادية أم VIP؟"
 
-    # 4) نوع السيارة
     if step == "ask_car":
         session["car"] = user_input
         session["step"] = "ask_audio"
@@ -112,7 +133,6 @@ def proceed(session: Dict[str, Any], user_input: str) -> str:
             "يمكنك اختيار القرآن الكريم، الموسيقى، أو الصمت."
         )
 
-    # 5) الصوت
     if step == "ask_audio":
         txt = user_input.strip().lower()
         if txt in {"القرآن", "قرآن", "quran"}:
@@ -120,19 +140,17 @@ def proceed(session: Dict[str, Any], user_input: str) -> str:
             session["step"] = "ask_reciter"
             return "هل لديك قارئ مفضل أو نوع تلاوة تفضله؟"
         else:
-            session["audio"] = user_input  # موسيقى أو صمت
+            session["audio"] = user_input
             session["step"] = "summary"
             return build_summary(session)
 
-    # 6) القارئ
     if step == "ask_reciter":
         session["reciter"] = user_input
         session["step"] = "summary"
         return build_summary(session)
 
-    # 7) الملــخّص والتأكيد
     if step == "summary":
-        if user_input.strip().lower() in {"نعم", "أجل", "أكيد", "نوافق"}:
+        if user_input.strip().lower() in {"نعم", "أجل", "أكيد", "موافق"}:
             session["step"] = "confirmed"
             return "تم تأكيد الحجز! ستصلك السيارة في الوقت المحدد."
         else:
@@ -152,10 +170,8 @@ def build_summary(s: Dict[str, Any]) -> str:
             base += f" بصوت {s['reciter']}"
     return base + ". هل تريد تأكيد الحجز بهذه التفاصيل؟"
 
-# ---------- نقطة نهاية واحدة ---------- #
 @app.post("/chatbot", response_model=BotResponse)
 def chatbot(req: UserRequest):
-    # جلسة جديدة
     if not req.sessionId or req.sessionId not in sessions:
         if req.lat is None or req.lng is None:
             return BotResponse(
@@ -165,7 +181,6 @@ def chatbot(req: UserRequest):
         sess_id, msg = new_session(req.lat, req.lng)
         return BotResponse(sessionId=sess_id, botMessage=msg)
 
-    # جلسة موجودة
     sess = sessions[req.sessionId]
     reply = proceed(sess, req.userInput or "")
     done = sess.get("step") in {"confirmed", "canceled"}
